@@ -17,6 +17,7 @@ RUN uv pip install --system --no-cache -r pyproject.toml
 
 # Copy application
 COPY app/ ./app/
+COPY ./scripts/ ./scripts/ 
 COPY .env.docker .env
 
 # Expose port

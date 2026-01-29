@@ -16,6 +16,7 @@ services:
       - ENVIRONMENT=development
     volumes:
       - ./app:/app/app
+      - ./scripts:/app/scripts
       - ./pyproject.toml:/app/pyproject.toml
     networks:
       - recommender-network
@@ -37,6 +38,8 @@ services:
       - POSTGRES_DB=recommender_db
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ./scripts:/app/scripts
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init.sql
     ports:
       - "5432:5432"
     networks:
