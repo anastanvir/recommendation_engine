@@ -3,14 +3,49 @@ from fastapi import FastAPI, Depends, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, text
+from pydantic import BaseModel
 import hashlib
 import json
-from typing import Optional
+from typing import Optional, List
 
 from .database import get_db_session, engine, Base
 from .redis_client import redis_manager
 from .models import User, Business, UserInteraction
 from .config import settings
+
+
+# =============================================================================
+# Request/Response Models (for Django integration)
+# =============================================================================
+
+class UserSync(BaseModel):
+    """Model for syncing users from Django"""
+    id: int
+    username: str
+    email: str
+    interests: List[str] = []
+    location: Optional[dict] = None
+
+
+class BusinessSync(BaseModel):
+    """Model for syncing businesses from Django"""
+    id: int
+    name: str
+    description: Optional[str] = None
+    categories: List[str] = []
+    tags: List[str] = []
+    location: Optional[dict] = None
+    popularity_score: float = 0.0
+    rating: float = 0.0
+    rating_count: int = 0
+
+
+class InteractionCreate(BaseModel):
+    """Model for recording interactions from Django"""
+    user_id: int
+    business_id: int
+    interaction_type: str  # view, like, save, purchase, share
+    weight: float = 1.0
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -249,7 +284,7 @@ async def get_user_interactions(
         .limit(limit)
     )
     interactions = result.scalars().all()
-    
+
     return {
         "user_id": user_id,
         "interactions_count": len(interactions),
@@ -263,3 +298,202 @@ async def get_user_interactions(
             for i in interactions
         ]
     }
+
+
+# =============================================================================
+# Django Integration Endpoints
+# =============================================================================
+
+@app.post("/sync/user")
+async def sync_user(user: UserSync, db: AsyncSession = Depends(get_db_session)):
+    """
+    Sync user from Django to recommendation engine.
+    Creates or updates user record.
+    """
+    try:
+        await db.execute(
+            text("""
+                INSERT INTO users (id, username, email, interests, location)
+                VALUES (:id, :username, :email, :interests, :location)
+                ON CONFLICT (id) DO UPDATE SET
+                    username = EXCLUDED.username,
+                    email = EXCLUDED.email,
+                    interests = EXCLUDED.interests,
+                    location = EXCLUDED.location,
+                    updated_at = CURRENT_TIMESTAMP
+            """),
+            {
+                "id": user.id,
+                "username": user.username,
+                "email": user.email,
+                "interests": json.dumps(user.interests),
+                "location": json.dumps(user.location) if user.location else None,
+            }
+        )
+        await db.commit()
+
+        # Invalidate user cache
+        client = await redis_manager.get_client()
+        keys = await client.keys(f"recs:{user.id}:*")
+        if keys:
+            await client.delete(*keys)
+
+        return {"status": "synced", "user_id": user.id}
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/sync/business")
+async def sync_business(business: BusinessSync, db: AsyncSession = Depends(get_db_session)):
+    """
+    Sync business from Django to recommendation engine.
+    Creates or updates business record.
+    """
+    try:
+        await db.execute(
+            text("""
+                INSERT INTO businesses (id, name, description, categories, tags, location, popularity_score, rating, rating_count)
+                VALUES (:id, :name, :description, :categories, :tags, :location, :popularity_score, :rating, :rating_count)
+                ON CONFLICT (id) DO UPDATE SET
+                    name = EXCLUDED.name,
+                    description = EXCLUDED.description,
+                    categories = EXCLUDED.categories,
+                    tags = EXCLUDED.tags,
+                    location = EXCLUDED.location,
+                    popularity_score = EXCLUDED.popularity_score,
+                    rating = EXCLUDED.rating,
+                    rating_count = EXCLUDED.rating_count,
+                    updated_at = CURRENT_TIMESTAMP
+            """),
+            {
+                "id": business.id,
+                "name": business.name,
+                "description": business.description,
+                "categories": json.dumps(business.categories),
+                "tags": json.dumps(business.tags),
+                "location": json.dumps(business.location) if business.location else None,
+                "popularity_score": business.popularity_score,
+                "rating": business.rating,
+                "rating_count": business.rating_count,
+            }
+        )
+        await db.commit()
+        return {"status": "synced", "business_id": business.id}
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/interaction")
+async def record_interaction(interaction: InteractionCreate, db: AsyncSession = Depends(get_db_session)):
+    """
+    Record user interaction from Django.
+    Used to track views, likes, saves, purchases, shares.
+    """
+    # Validate interaction type
+    valid_types = {'view', 'like', 'save', 'purchase', 'share'}
+    if interaction.interaction_type not in valid_types:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid interaction_type. Must be one of: {valid_types}"
+        )
+
+    try:
+        await db.execute(
+            text("""
+                INSERT INTO user_interactions (user_id, business_id, interaction_type, weight)
+                VALUES (:user_id, :business_id, :interaction_type, :weight)
+                ON CONFLICT (user_id, business_id, interaction_type)
+                DO UPDATE SET
+                    weight = EXCLUDED.weight,
+                    timestamp = CURRENT_TIMESTAMP
+            """),
+            {
+                "user_id": interaction.user_id,
+                "business_id": interaction.business_id,
+                "interaction_type": interaction.interaction_type,
+                "weight": interaction.weight,
+            }
+        )
+        await db.commit()
+
+        # Invalidate user's recommendation cache
+        client = await redis_manager.get_client()
+        keys = await client.keys(f"recs:{interaction.user_id}:*")
+        if keys:
+            await client.delete(*keys)
+
+        return {
+            "status": "recorded",
+            "user_id": interaction.user_id,
+            "business_id": interaction.business_id,
+            "interaction_type": interaction.interaction_type
+        }
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/sync/user/{user_id}")
+async def delete_user(user_id: int, db: AsyncSession = Depends(get_db_session)):
+    """Delete user and their interactions (for GDPR compliance, etc.)"""
+    try:
+        # Delete interactions first (cascade should handle this, but explicit is safer)
+        await db.execute(
+            text("DELETE FROM user_interactions WHERE user_id = :user_id"),
+            {"user_id": user_id}
+        )
+
+        # Delete user
+        result = await db.execute(
+            text("DELETE FROM users WHERE id = :user_id RETURNING id"),
+            {"user_id": user_id}
+        )
+        deleted = result.fetchone()
+        await db.commit()
+
+        if not deleted:
+            raise HTTPException(status_code=404, detail=f"User {user_id} not found")
+
+        # Clear cache
+        client = await redis_manager.get_client()
+        keys = await client.keys(f"*{user_id}*")
+        if keys:
+            await client.delete(*keys)
+
+        return {"status": "deleted", "user_id": user_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/sync/business/{business_id}")
+async def delete_business(business_id: int, db: AsyncSession = Depends(get_db_session)):
+    """Delete business and related interactions"""
+    try:
+        # Delete interactions first
+        await db.execute(
+            text("DELETE FROM user_interactions WHERE business_id = :business_id"),
+            {"business_id": business_id}
+        )
+
+        # Delete business
+        result = await db.execute(
+            text("DELETE FROM businesses WHERE id = :business_id RETURNING id"),
+            {"business_id": business_id}
+        )
+        deleted = result.fetchone()
+        await db.commit()
+
+        if not deleted:
+            raise HTTPException(status_code=404, detail=f"Business {business_id} not found")
+
+        return {"status": "deleted", "business_id": business_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))

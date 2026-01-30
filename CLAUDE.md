@@ -24,7 +24,8 @@ make test               # Run pytest in container
 
 # Database
 make db-shell           # Open PostgreSQL CLI
-make seed               # Seed database with init-db.sql
+make seed               # Seed database with test data (100 businesses, 200 users, 30 days)
+make seed-large         # Seed with larger dataset (500 businesses, 1000 users, 90 days)
 
 # Other
 make redis-shell        # Open Redis CLI

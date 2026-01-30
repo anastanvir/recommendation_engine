@@ -1,4 +1,4 @@
-.PHONY: help build up down logs restart clean test db-shell redis-shell hti-data hti-seed
+.PHONY: help build up down logs restart clean test db-shell redis-shell seed
 
 help:
 	@echo "Available commands:"
@@ -12,10 +12,7 @@ help:
 	@echo "  test        - Run tests"
 	@echo "  db-shell    - Open PostgreSQL shell"
 	@echo "  redis-shell - Open Redis CLI"
-	@echo ""
-	@echo "HTI Data Generation:"
-	@echo "  hti-data    - Generate 6 months of HTI super app test data (1200 users, 600 businesses)"
-	@echo "  hti-seed    - Quick seed with sample HTI data for testing"
+	@echo "  seed        - Seed database with test data"
 
 build:
 	docker-compose build --no-cache
@@ -58,27 +55,20 @@ migrate:
 	docker-compose exec recommender alembic upgrade head
 
 seed:
-	docker-compose exec postgres psql -U recommender -d recommender_db -f /docker-entrypoint-initdb.d/init.sql
+	@echo "Seeding database with test data..."
+	docker-compose exec recommender python scripts/seed_data.py
+
+seed-large:
+	@echo "Seeding database with large dataset..."
+	docker-compose exec recommender python scripts/seed_data.py --businesses 500 --users 1000 --days 90
 
 health:
 	curl http://localhost:8000/health
 
-# HTI Super App Data Generation
-hti-data:
-	@echo "Generating 6 months of HTI super app test data..."
-	@echo "This will create 1200 users, 600 businesses, and ~500K+ interactions"
-	docker-compose exec recommender python scripts/hti_social_marketplace_generator.py
-
-hti-seed:
-	@echo "Loading HTI sample seed data..."
-	docker-compose exec postgres psql -U recommender -d recommender_db -f /app/scripts/hti_seed_data.sql
-
 # Test recommendation endpoints
 test-recs:
 	@echo "Testing recommendation endpoints..."
-	@echo "\n--- User 1 (Social Butterfly) ---"
+	@echo "\n--- User 1 ---"
 	curl -s http://localhost:8000/recommend/1 | python -m json.tool
-	@echo "\n--- User 4 (Shopper) ---"
-	curl -s http://localhost:8000/recommend/4 | python -m json.tool
-	@echo "\n--- User 7 (Professional) ---"
-	curl -s http://localhost:8000/recommend/7 | python -m json.tool
+	@echo "\n--- User 2 ---"
+	curl -s http://localhost:8000/recommend/2 | python -m json.tool
